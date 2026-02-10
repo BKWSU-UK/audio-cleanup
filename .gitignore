@@ -211,3 +211,6 @@ pipeline-in/*
 !pipeline-in/.gitkeep
 pipeline-out/*
 !pipeline-out/.gitkeep
+
+# AI model checkpoints (downloaded by ClearVoice)
+checkpoints/
