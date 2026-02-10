@@ -88,6 +88,40 @@ python pipeline.py --input /path/to/input --output /path/to/output
 
 The pipeline supports extensive customization through command-line arguments:
 
+#### Phase Control
+
+You can disable any processing phase to customize the pipeline:
+
+```bash
+# Skip AI enhancement (faster, no model download required)
+python pipeline.py --no-ai
+
+# Skip noise reduction
+python pipeline.py --no-spectral-denoise
+
+# Skip noise gate
+python pipeline.py --no-noise-gate
+
+# Skip preprocessing (channel selection, normalization)
+python pipeline.py --no-preprocessing
+
+# Skip mastering (EQ, de-essing, loudness normalization)
+python pipeline.py --no-mastering
+
+# Combine multiple flags - only run AI enhancement
+python pipeline.py --no-preprocessing --no-spectral-denoise --no-noise-gate --no-mastering
+
+# Minimal processing - just format conversion
+python pipeline.py --no-preprocessing --no-ai --no-spectral-denoise --no-noise-gate --no-mastering
+```
+
+**Available phase flags:**
+- `--no-preprocessing` - Disable channel selection, clipping, and normalization
+- `--no-ai` - Disable AI enhancement (skips ClearVoice model)
+- `--no-spectral-denoise` - Disable spectral noise reduction
+- `--no-noise-gate` - Disable noise gate
+- `--no-mastering` - Disable EQ, de-essing, and loudness normalization
+
 #### Output Settings
 ```bash
 # Format selection
@@ -136,18 +170,28 @@ python pipeline.py --help
 
 ## Processing Pipeline
 
-The pipeline processes audio through the following stages:
+The pipeline processes audio through the following stages (all can be individually disabled):
 
-1. **Channel Selection**: Analyzes stereo files and selects the channel with better SNR
-2. **Preprocessing**: 
+1. **Preprocessing** (`--no-preprocessing` to disable):
+   - Analyzes stereo files and selects the channel with better SNR
    - Clips transient peaks (mic knocks)
    - Applies low-pass filter if poor high-frequency content is detected
    - Speech normalization
    - Headroom adjustment for AI processing
-3. **AI Enhancement**: ClearVoice MossFormer2 speech enhancement
-4. **Spectral Noise Reduction**: Adaptive noise profile detection and removal
-5. **Noise Gate**: Removes residual hiss in quiet passages
-6. **Adaptive Mastering**:
+
+2. **AI Enhancement** (`--no-ai` to disable):
+   - ClearVoice MossFormer2 speech enhancement
+   - Downloads model on first run (~222MB)
+
+3. **Spectral Noise Reduction** (`--no-spectral-denoise` to disable):
+   - Adaptive noise profile detection and removal
+   - Self-calibrating (similar to Audacity's noise reduction)
+
+4. **Noise Gate** (`--no-noise-gate` to disable):
+   - Removes residual hiss in quiet passages
+   - Configurable threshold, attack, and release
+
+5. **Adaptive Mastering** (`--no-mastering` to disable):
    - High-pass filtering
    - Intelligent EQ based on clarity analysis
    - De-essing

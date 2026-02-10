@@ -14,6 +14,13 @@ from clearvoice import ClearVoice
 class PipelineConfig:
     """Default configuration parameters for the audio processing pipeline."""
     
+    # Phase control - enable/disable processing stages
+    ENABLE_PREPROCESSING = True  # Channel selection, clipping, normalization
+    ENABLE_AI_ENHANCEMENT = True  # ClearVoice AI enhancement
+    ENABLE_SPECTRAL_DENOISE = True  # Adaptive spectral noise reduction
+    ENABLE_NOISE_GATE = True  # Noise gate for quiet passages
+    ENABLE_MASTERING = True  # EQ, de-essing, loudness normalization
+    
     # Output settings
     OUTPUT_BITRATE = 64  # Opus bitrate in kbps (ignored for FLAC)
     OUTPUT_FORMAT = 'opus'  # Output format: 'opus' or 'flac'
@@ -51,8 +58,10 @@ class IntelligentStudioPipeline:
             config: PipelineConfig object or None to use defaults
         """
         self.config = config if config is not None else PipelineConfig()
-        # Initialize the AI engine
-        self.ai_engine = ClearVoice(task='speech_enhancement', model_names=['MossFormer2_SE_48K'])
+        # Initialize the AI engine only if needed
+        self.ai_engine = None
+        if self.config.ENABLE_AI_ENHANCEMENT:
+            self.ai_engine = ClearVoice(task='speech_enhancement', model_names=['MossFormer2_SE_48K'])
 
     def _convert_to_wav_for_analysis(self, audio_path):
         """Convert any audio format to temporary WAV for analysis."""
@@ -403,80 +412,122 @@ class IntelligentStudioPipeline:
 
         # Place temp files in the output directory specifically
         base_name = os.path.splitext(filename)[0]
-        temp_pre = os.path.join(output_dir, f"1-preprocessed_{base_name}.wav")
-        temp_ai = os.path.join(output_dir, f"2-ai_enhanced_{base_name}.wav")
-
+        temp_files = []  # Track temp files for cleanup
+        
+        # Track the current working file through the pipeline
+        current_file = raw_path
+        
         # 1. PRE-PROCESSING DECISION
-        # Check if stereo and select best channel
-        best_channel = self.select_best_channel(raw_path)
-        
-        # Build channel selection filter
-        if best_channel is not None:
-            channel_filter = f"pan=mono|c0=c{best_channel},"
-        else:
-            channel_filter = ""
-        
-        # We check the original file for frequency health.
-        if self.needs_low_pass(raw_path):
-            print(f"Decision: Poor HF detected. Applying {self.config.LOW_PASS_CUTOFF}Hz Low-pass pre-filter.")
-            # Clip transient peaks (mic knocks), low-pass, normalize speech, then reduce by 2dB for AI headroom
-            cmd = f"ffmpeg -i '{raw_path}' -af '{channel_filter}alimiter=limit=0.95:attack=0.1:release=5,lowpass=f={self.config.LOW_PASS_CUTOFF},speechnorm=expansion={self.config.SPEECHNORM_EXPANSION},volume=-2dB' -ar 48000 '{temp_pre}' -y"
-        else:
-            print(f"Decision: HF health is good. Preserving original bandwidth.")
-            # Clip transient peaks (mic knocks) first, then normalize speech, then reduce by 2dB for AI headroom
-            cmd = f"ffmpeg -i '{raw_path}' -af '{channel_filter}alimiter=limit=0.95:attack=0.1:release=5,speechnorm=expansion={self.config.SPEECHNORM_EXPANSION},volume=-2dB' -ar 48000 '{temp_pre}' -y"
+        if self.config.ENABLE_PREPROCESSING:
+            print("[1/5] Preprocessing...")
+            temp_pre = os.path.join(output_dir, f"1-preprocessed_{base_name}.wav")
+            temp_files.append(temp_pre)
+            
+            # Check if stereo and select best channel
+            best_channel = self.select_best_channel(raw_path)
+            
+            # Build channel selection filter
+            if best_channel is not None:
+                channel_filter = f"pan=mono|c0=c{best_channel},"
+            else:
+                channel_filter = ""
+            
+            # We check the original file for frequency health.
+            if self.needs_low_pass(raw_path):
+                print(f"Decision: Poor HF detected. Applying {self.config.LOW_PASS_CUTOFF}Hz Low-pass pre-filter.")
+                # Clip transient peaks (mic knocks), low-pass, normalize speech, then reduce by 2dB for AI headroom
+                cmd = f"ffmpeg -i '{raw_path}' -af '{channel_filter}alimiter=limit=0.95:attack=0.1:release=5,lowpass=f={self.config.LOW_PASS_CUTOFF},speechnorm=expansion={self.config.SPEECHNORM_EXPANSION},volume=-2dB' -ar 48000 '{temp_pre}' -y"
+            else:
+                print(f"Decision: HF health is good. Preserving original bandwidth.")
+                # Clip transient peaks (mic knocks) first, then normalize speech, then reduce by 2dB for AI headroom
+                cmd = f"ffmpeg -i '{raw_path}' -af '{channel_filter}alimiter=limit=0.95:attack=0.1:release=5,speechnorm=expansion={self.config.SPEECHNORM_EXPANSION},volume=-2dB' -ar 48000 '{temp_pre}' -y"
 
-        subprocess.run(cmd, shell=True, capture_output=True)
+            subprocess.run(cmd, shell=True, capture_output=True)
+            current_file = temp_pre
+        else:
+            print("[1/5] Preprocessing: SKIPPED")
 
         # 2. AI ENHANCEMENT
-        output_audio = self.ai_engine(input_path=temp_pre, online_write=False)
-        self.ai_engine.write(output_audio, output_path=temp_ai)
+        if self.config.ENABLE_AI_ENHANCEMENT:
+            print("[2/5] AI Enhancement...")
+            temp_ai = os.path.join(output_dir, f"2-ai_enhanced_{base_name}.wav")
+            temp_files.append(temp_ai)
+            output_audio = self.ai_engine(input_path=current_file, online_write=False)
+            self.ai_engine.write(output_audio, output_path=temp_ai)
+            current_file = temp_ai
+        else:
+            print("[2/5] AI Enhancement: SKIPPED")
 
         # 3. SPECTRAL NOISE REDUCTION
-        # Apply self-calibrating spectral denoise after AI enhancement
-        temp_denoised = os.path.join(output_dir, f"3-spectral_denoised_{base_name}.wav")
-        print(f"Applying adaptive spectral noise reduction ({self.config.NOISE_REDUCTION_DB}dB, sensitivity={self.config.NOISE_SENSITIVITY})...")
-        self.adaptive_spectral_denoise(temp_ai, temp_denoised)
+        if self.config.ENABLE_SPECTRAL_DENOISE:
+            print(f"[3/5] Applying adaptive spectral noise reduction ({self.config.NOISE_REDUCTION_DB}dB, sensitivity={self.config.NOISE_SENSITIVITY})...")
+            temp_denoised = os.path.join(output_dir, f"3-spectral_denoised_{base_name}.wav")
+            temp_files.append(temp_denoised)
+            self.adaptive_spectral_denoise(current_file, temp_denoised)
+            current_file = temp_denoised
+        else:
+            print("[3/5] Spectral Noise Reduction: SKIPPED")
         
-        # 3.5. NOISE GATE
-        # Apply noise gate to remove residual hiss in quiet passages
-        temp_gated = os.path.join(output_dir, f"4-noise_gated_{base_name}.wav")
-        print(f"Applying noise gate ({self.config.GATE_THRESHOLD_DB}dB threshold)...")
-        self.apply_noise_gate(temp_denoised, temp_gated)
+        # 4. NOISE GATE
+        if self.config.ENABLE_NOISE_GATE:
+            print(f"[4/5] Applying noise gate ({self.config.GATE_THRESHOLD_DB}dB threshold)...")
+            temp_gated = os.path.join(output_dir, f"4-noise_gated_{base_name}.wav")
+            temp_files.append(temp_gated)
+            self.apply_noise_gate(current_file, temp_gated)
+            current_file = temp_gated
+        else:
+            print("[4/5] Noise Gate: SKIPPED")
         
-        # 4. ADAPTIVE MASTERING
-        boost_db = self.analyze_clarity(temp_gated)
-        # Ensure temp file exists before calling FFmpeg
-        if not os.path.exists(temp_gated):
-            print(f"CRITICAL ERROR: Noise gate failed to create {temp_gated}")
-            return
+        # 5. ADAPTIVE MASTERING
+        if self.config.ENABLE_MASTERING:
+            print("[5/5] Mastering...")
+            boost_db = self.analyze_clarity(current_file)
+            # Ensure temp file exists before calling FFmpeg
+            if not os.path.exists(current_file):
+                print(f"CRITICAL ERROR: Input file missing: {current_file}")
+                return
 
-        # Build encoding parameters based on output format
-        if self.config.OUTPUT_FORMAT == 'flac':
-            codec_params = "-c:a flac -compression_level 8"
-        else:  # opus
-            codec_params = f"-c:a libopus -b:a {self.config.OUTPUT_BITRATE}k"
-        
-        master_cmd = (
-            f"ffmpeg -i '{temp_gated}' -af "
-            f"'highpass=f={self.config.HIGHPASS_FREQ}, "
-            f"equalizer=f={self.config.EQ_CENTER_FREQ}:width_type=h:width={self.config.EQ_WIDTH}:g={boost_db}, "
-            f"deesser=f={self.config.DEESSER_FREQ}:s={self.config.DEESSER_STRENGTH}, "
-            f"loudnorm=I={self.config.LOUDNESS_TARGET}:TP={self.config.TRUE_PEAK}, "
-            f"alimiter=limit=0.99:attack=1:release=50:level=disabled' "
-            f"-ac 1 {codec_params} '{output_path}' -y"
-        )
+            # Build encoding parameters based on output format
+            if self.config.OUTPUT_FORMAT == 'flac':
+                codec_params = "-c:a flac -compression_level 8"
+            else:  # opus
+                codec_params = f"-c:a libopus -b:a {self.config.OUTPUT_BITRATE}k"
+            
+            master_cmd = (
+                f"ffmpeg -i '{current_file}' -af "
+                f"'highpass=f={self.config.HIGHPASS_FREQ}, "
+                f"equalizer=f={self.config.EQ_CENTER_FREQ}:width_type=h:width={self.config.EQ_WIDTH}:g={boost_db}, "
+                f"deesser=f={self.config.DEESSER_FREQ}:s={self.config.DEESSER_STRENGTH}, "
+                f"loudnorm=I={self.config.LOUDNESS_TARGET}:TP={self.config.TRUE_PEAK}, "
+                f"alimiter=limit=0.99:attack=1:release=50:level=disabled' "
+                f"-ac 1 {codec_params} '{output_path}' -y"
+            )
 
-        # Use check=True to catch FFmpeg failures
-        try:
-            result = subprocess.run(master_cmd, shell=True, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            print("FFMPEG ERROR OUTPUT:")
-            print(e.stderr) # This will tell you EXACTLY why the file wasn't created
-            return
+            # Use check=True to catch FFmpeg failures
+            try:
+                result = subprocess.run(master_cmd, shell=True, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                print("FFMPEG ERROR OUTPUT:")
+                print(e.stderr) # This will tell you EXACTLY why the file wasn't created
+                return
+        else:
+            print("[5/5] Mastering: SKIPPED")
+            # If mastering is skipped, just copy/convert the current file to output
+            if self.config.OUTPUT_FORMAT == 'flac':
+                codec_params = "-c:a flac -compression_level 8"
+            else:  # opus
+                codec_params = f"-c:a libopus -b:a {self.config.OUTPUT_BITRATE}k"
+            
+            copy_cmd = f"ffmpeg -i '{current_file}' -ac 1 {codec_params} '{output_path}' -y"
+            try:
+                subprocess.run(copy_cmd, shell=True, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                print("FFMPEG ERROR OUTPUT:")
+                print(e.stderr)
+                return
 
         # Cleanup intermediate files
-        for f in [temp_pre, temp_ai, temp_denoised, temp_gated]:
+        for f in temp_files:
             if os.path.exists(f): os.remove(f)
         print(f"Finished: {output_path}")
 
@@ -529,6 +580,18 @@ if __name__ == "__main__":
     parser.add_argument('--output', '-o', type=str, default='pipeline-out',
                         help='Output directory for processed files')
     
+    # Phase control arguments
+    parser.add_argument('--no-preprocessing', action='store_true',
+                        help='Disable preprocessing (channel selection, clipping, normalization)')
+    parser.add_argument('--no-ai', action='store_true',
+                        help='Disable AI enhancement')
+    parser.add_argument('--no-spectral-denoise', action='store_true',
+                        help='Disable spectral noise reduction')
+    parser.add_argument('--no-noise-gate', action='store_true',
+                        help='Disable noise gate')
+    parser.add_argument('--no-mastering', action='store_true',
+                        help='Disable mastering (EQ, de-essing, loudness normalization)')
+    
     # Output settings
     parser.add_argument('--format', type=str, default=PipelineConfig.OUTPUT_FORMAT,
                         choices=['opus', 'flac'],
@@ -572,6 +635,13 @@ if __name__ == "__main__":
     
     # Create custom config from command-line arguments
     config = PipelineConfig()
+    # Phase control
+    config.ENABLE_PREPROCESSING = not args.no_preprocessing
+    config.ENABLE_AI_ENHANCEMENT = not args.no_ai
+    config.ENABLE_SPECTRAL_DENOISE = not args.no_spectral_denoise
+    config.ENABLE_NOISE_GATE = not args.no_noise_gate
+    config.ENABLE_MASTERING = not args.no_mastering
+    # Output settings
     config.OUTPUT_FORMAT = args.format
     config.OUTPUT_BITRATE = args.bitrate
     config.NOISE_REDUCTION_DB = args.noise_reduction
@@ -600,11 +670,23 @@ if __name__ == "__main__":
         print(f"Bitrate:            {config.OUTPUT_BITRATE} kbps")
     else:
         print(f"Compression:        FLAC level 8 (lossless)")
-    print(f"Noise Reduction:    {config.NOISE_REDUCTION_DB} dB (sensitivity: {config.NOISE_SENSITIVITY})")
-    print(f"Noise Gate:         {config.GATE_THRESHOLD_DB} dB (attack: {config.GATE_ATTACK_MS}ms, release: {config.GATE_RELEASE_MS}ms)")
-    print(f"Low-pass Cutoff:    {config.LOW_PASS_CUTOFF} Hz")
-    print(f"Highpass:           {config.HIGHPASS_FREQ} Hz")
-    print(f"Loudness Target:    {config.LOUDNESS_TARGET} LUFS (peak: {config.TRUE_PEAK} dB)")
+    print()
+    print("Processing Phases:")
+    print(f"  [1] Preprocessing:        {'ENABLED' if config.ENABLE_PREPROCESSING else 'DISABLED'}")
+    print(f"  [2] AI Enhancement:       {'ENABLED' if config.ENABLE_AI_ENHANCEMENT else 'DISABLED'}")
+    print(f"  [3] Spectral Denoise:     {'ENABLED' if config.ENABLE_SPECTRAL_DENOISE else 'DISABLED'}")
+    print(f"  [4] Noise Gate:           {'ENABLED' if config.ENABLE_NOISE_GATE else 'DISABLED'}")
+    print(f"  [5] Mastering:            {'ENABLED' if config.ENABLE_MASTERING else 'DISABLED'}")
+    print()
+    if config.ENABLE_SPECTRAL_DENOISE:
+        print(f"Noise Reduction:    {config.NOISE_REDUCTION_DB} dB (sensitivity: {config.NOISE_SENSITIVITY})")
+    if config.ENABLE_NOISE_GATE:
+        print(f"Noise Gate:         {config.GATE_THRESHOLD_DB} dB (attack: {config.GATE_ATTACK_MS}ms, release: {config.GATE_RELEASE_MS}ms)")
+    if config.ENABLE_PREPROCESSING:
+        print(f"Low-pass Cutoff:    {config.LOW_PASS_CUTOFF} Hz")
+    if config.ENABLE_MASTERING:
+        print(f"Highpass:           {config.HIGHPASS_FREQ} Hz")
+        print(f"Loudness Target:    {config.LOUDNESS_TARGET} LUFS (peak: {config.TRUE_PEAK} dB)")
     print("=" * 70)
     print()
     
