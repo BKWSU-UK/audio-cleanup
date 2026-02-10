@@ -64,6 +64,18 @@ python pipeline.py
 
 Processed files will appear in the `pipeline-out` directory as Opus files (64 kbps by default).
 
+### Output Format Selection
+
+Choose between lossy Opus (small files) or lossless FLAC (large files):
+
+```bash
+# Lossless FLAC output (larger files, perfect quality)
+python pipeline.py --format flac
+
+# Lossy Opus output (default, smaller files, excellent quality)
+python pipeline.py --format opus --bitrate 64
+```
+
 ### Custom Input/Output Directories
 
 ```bash
@@ -76,7 +88,12 @@ The pipeline supports extensive customization through command-line arguments:
 
 #### Output Settings
 ```bash
-python pipeline.py --bitrate 96  # Output bitrate in kbps (default: 64)
+# Format selection
+python pipeline.py --format flac           # Lossless FLAC output
+python pipeline.py --format opus           # Lossy Opus output (default)
+
+# Bitrate (only for Opus format)
+python pipeline.py --bitrate 96            # Output bitrate in kbps (default: 64)
 ```
 
 #### Noise Reduction
@@ -139,12 +156,24 @@ The pipeline processes audio through the following stages:
 
 Default configuration can be found in the `PipelineConfig` class in `pipeline.py`. You can modify these defaults or override them via command-line arguments.
 
-## Output Format
+## Output Formats
 
-By default, files are output as Opus format at 64 kbps, which provides excellent quality for speech at small file sizes. The output format is optimized for:
+The pipeline supports two output formats:
 
+### Opus (Default)
+Lossy compression optimized for speech at 64 kbps by default:
+- **Pros**: Very small file sizes, excellent speech quality
+- **Cons**: Lossy compression (though imperceptible for speech)
+- **Use case**: Podcasts, streaming, archival where space matters
+
+### FLAC
+Lossless compression with no quality loss:
+- **Pros**: Perfect audio reproduction, still compressed (~50% size reduction)
+- **Cons**: Larger files than Opus
+- **Use case**: Archival masters, further processing, maximum quality
+
+Both formats are optimized for:
 - Speech clarity
-- Small file size
 - Broadcast-ready loudness (-16 LUFS)
 - Controlled peaks (-1.5 dB true peak)
 

@@ -15,8 +15,8 @@ class PipelineConfig:
     """Default configuration parameters for the audio processing pipeline."""
     
     # Output settings
-    OUTPUT_BITRATE = 64  # Opus bitrate in kbps
-    OUTPUT_FORMAT = 'opus'  # Output format (opus, mp3, etc.)
+    OUTPUT_BITRATE = 64  # Opus bitrate in kbps (ignored for FLAC)
+    OUTPUT_FORMAT = 'opus'  # Output format: 'opus' or 'flac'
     
     # Noise reduction settings
     NOISE_REDUCTION_DB = 12  # Amount of spectral noise reduction in dB
@@ -451,6 +451,12 @@ class IntelligentStudioPipeline:
             print(f"CRITICAL ERROR: Noise gate failed to create {temp_gated}")
             return
 
+        # Build encoding parameters based on output format
+        if self.config.OUTPUT_FORMAT == 'flac':
+            codec_params = "-c:a flac -compression_level 8"
+        else:  # opus
+            codec_params = f"-c:a libopus -b:a {self.config.OUTPUT_BITRATE}k"
+        
         master_cmd = (
             f"ffmpeg -i {temp_gated} -af "
             f"'highpass=f={self.config.HIGHPASS_FREQ}, "
@@ -458,7 +464,7 @@ class IntelligentStudioPipeline:
             f"deesser=f={self.config.DEESSER_FREQ}:s={self.config.DEESSER_STRENGTH}, "
             f"loudnorm=I={self.config.LOUDNESS_TARGET}:TP={self.config.TRUE_PEAK}, "
             f"alimiter=limit=0.99:attack=1:release=50:level=disabled' "
-            f"-ac 1 -c:a libopus -b:a {self.config.OUTPUT_BITRATE}k {output_path} -y"
+            f"-ac 1 {codec_params} {output_path} -y"
         )
 
         # Use check=True to catch FFmpeg failures
@@ -499,8 +505,8 @@ class IntelligentStudioPipeline:
         for i, input_file in enumerate(audio_files, 1):
             print(f"\n[{i}/{len(audio_files)}] Processing: {input_file.name}")
             
-            # Generate output filename with .opus extension
-            output_file = output_path / f"{input_file.stem}.opus"
+            # Generate output filename with appropriate extension
+            output_file = output_path / f"{input_file.stem}.{self.config.OUTPUT_FORMAT}"
             
             try:
                 self.process_file(str(input_file), str(output_file))
@@ -524,8 +530,11 @@ if __name__ == "__main__":
                         help='Output directory for processed files')
     
     # Output settings
+    parser.add_argument('--format', type=str, default=PipelineConfig.OUTPUT_FORMAT,
+                        choices=['opus', 'flac'],
+                        help='Output format: opus (lossy, small) or flac (lossless, large)')
     parser.add_argument('--bitrate', type=int, default=PipelineConfig.OUTPUT_BITRATE,
-                        help='Output bitrate in kbps')
+                        help='Output bitrate in kbps (only for opus format)')
     
     # Noise reduction settings
     parser.add_argument('--noise-reduction', type=float, default=PipelineConfig.NOISE_REDUCTION_DB,
@@ -563,6 +572,7 @@ if __name__ == "__main__":
     
     # Create custom config from command-line arguments
     config = PipelineConfig()
+    config.OUTPUT_FORMAT = args.format
     config.OUTPUT_BITRATE = args.bitrate
     config.NOISE_REDUCTION_DB = args.noise_reduction
     config.NOISE_SENSITIVITY = args.noise_sensitivity
@@ -585,7 +595,11 @@ if __name__ == "__main__":
     print("=" * 70)
     print(f"Input:              {args.input}")
     print(f"Output:             {args.output}")
-    print(f"Bitrate:            {config.OUTPUT_BITRATE} kbps")
+    print(f"Format:             {config.OUTPUT_FORMAT.upper()}")
+    if config.OUTPUT_FORMAT == 'opus':
+        print(f"Bitrate:            {config.OUTPUT_BITRATE} kbps")
+    else:
+        print(f"Compression:        FLAC level 8 (lossless)")
     print(f"Noise Reduction:    {config.NOISE_REDUCTION_DB} dB (sensitivity: {config.NOISE_SENSITIVITY})")
     print(f"Noise Gate:         {config.GATE_THRESHOLD_DB} dB (attack: {config.GATE_ATTACK_MS}ms, release: {config.GATE_RELEASE_MS}ms)")
     print(f"Low-pass Cutoff:    {config.LOW_PASS_CUTOFF} Hz")
