@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Input and output directories
+pipeline-in/*
+!pipeline-in/.gitkeep
+pipeline-out/*
+!pipeline-out/.gitkeep

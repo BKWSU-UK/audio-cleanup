@@ -1,0 +1,14 @@
+# Audio Processing Pipeline Requirements
+
+# Core AI enhancement
+clearvoice
+
+# Audio processing and analysis
+numpy>=1.24.0
+scipy>=1.10.0
+
+# No additional requirements needed - FFmpeg is assumed to be installed system-wide
+# Install FFmpeg separately:
+# - Ubuntu/Debian: sudo apt-get install ffmpeg
+# - macOS: brew install ffmpeg
+# - Windows: Download from https://ffmpeg.org/download.html
