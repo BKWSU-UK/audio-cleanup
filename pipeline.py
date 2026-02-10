@@ -60,7 +60,7 @@ class IntelligentStudioPipeline:
         temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         temp_wav.close()
         
-        cmd = f"ffmpeg -i {audio_path} -ar 48000 {temp_wav.name} -y"
+        cmd = f"ffmpeg -i '{audio_path}' -ar 48000 '{temp_wav.name}' -y"
         result = subprocess.run(cmd, shell=True, capture_output=True)
         
         if result.returncode != 0:
@@ -420,11 +420,11 @@ class IntelligentStudioPipeline:
         if self.needs_low_pass(raw_path):
             print(f"Decision: Poor HF detected. Applying {self.config.LOW_PASS_CUTOFF}Hz Low-pass pre-filter.")
             # Clip transient peaks (mic knocks), low-pass, normalize speech, then reduce by 2dB for AI headroom
-            cmd = f"ffmpeg -i {raw_path} -af '{channel_filter}alimiter=limit=0.95:attack=0.1:release=5,lowpass=f={self.config.LOW_PASS_CUTOFF},speechnorm=expansion={self.config.SPEECHNORM_EXPANSION},volume=-2dB' -ar 48000 {temp_pre} -y"
+            cmd = f"ffmpeg -i '{raw_path}' -af '{channel_filter}alimiter=limit=0.95:attack=0.1:release=5,lowpass=f={self.config.LOW_PASS_CUTOFF},speechnorm=expansion={self.config.SPEECHNORM_EXPANSION},volume=-2dB' -ar 48000 '{temp_pre}' -y"
         else:
             print(f"Decision: HF health is good. Preserving original bandwidth.")
             # Clip transient peaks (mic knocks) first, then normalize speech, then reduce by 2dB for AI headroom
-            cmd = f"ffmpeg -i {raw_path} -af '{channel_filter}alimiter=limit=0.95:attack=0.1:release=5,speechnorm=expansion={self.config.SPEECHNORM_EXPANSION},volume=-2dB' -ar 48000 {temp_pre} -y"
+            cmd = f"ffmpeg -i '{raw_path}' -af '{channel_filter}alimiter=limit=0.95:attack=0.1:release=5,speechnorm=expansion={self.config.SPEECHNORM_EXPANSION},volume=-2dB' -ar 48000 '{temp_pre}' -y"
 
         subprocess.run(cmd, shell=True, capture_output=True)
 
@@ -458,13 +458,13 @@ class IntelligentStudioPipeline:
             codec_params = f"-c:a libopus -b:a {self.config.OUTPUT_BITRATE}k"
         
         master_cmd = (
-            f"ffmpeg -i {temp_gated} -af "
+            f"ffmpeg -i '{temp_gated}' -af "
             f"'highpass=f={self.config.HIGHPASS_FREQ}, "
             f"equalizer=f={self.config.EQ_CENTER_FREQ}:width_type=h:width={self.config.EQ_WIDTH}:g={boost_db}, "
             f"deesser=f={self.config.DEESSER_FREQ}:s={self.config.DEESSER_STRENGTH}, "
             f"loudnorm=I={self.config.LOUDNESS_TARGET}:TP={self.config.TRUE_PEAK}, "
             f"alimiter=limit=0.99:attack=1:release=50:level=disabled' "
-            f"-ac 1 {codec_params} {output_path} -y"
+            f"-ac 1 {codec_params} '{output_path}' -y"
         )
 
         # Use check=True to catch FFmpeg failures
