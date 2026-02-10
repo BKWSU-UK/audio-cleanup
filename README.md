@@ -2,6 +2,8 @@
 
 An intelligent AI-powered audio processing pipeline for cleaning up speech recordings. Combines state-of-the-art AI enhancement with traditional DSP techniques including spectral noise reduction, noise gating, and adaptive mastering.
 
+Created using Claude 4.5 Sonnet
+
 ## Features
 
 - **AI Enhancement**: Uses ClearVoice MossFormer2 for speech enhancement
