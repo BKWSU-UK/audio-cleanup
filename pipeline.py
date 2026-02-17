@@ -649,11 +649,24 @@ class IntelligentStudioPipeline:
         # 5. ADAPTIVE MASTERING
         if self.config.ENABLE_MASTERING:
             print("[5/5] Mastering...")
-            boost_db = self.analyze_clarity(current_file)
             # Ensure temp file exists before calling FFmpeg
             if not os.path.exists(current_file):
                 print(f"CRITICAL ERROR: Input file missing: {current_file}")
                 return
+
+            # Check file duration FIRST to avoid loading large files into memory
+            # Use ffprobe to get duration without loading entire file into memory
+            duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 '{current_file}'"
+            duration_result = subprocess.run(duration_cmd, shell=True, capture_output=True, text=True)
+            duration_seconds = float(duration_result.stdout.strip())
+            duration_minutes = duration_seconds / 60
+            
+            # For large files, use a conservative EQ boost to avoid analyze_clarity loading entire file into memory
+            if duration_minutes > 60:
+                print(f"  Large file ({duration_minutes:.1f} minutes) - using conservative EQ settings...")
+                boost_db = 2  # Conservative boost for large files
+            else:
+                boost_db = self.analyze_clarity(current_file)
 
             # Build encoding parameters based on output format
             if self.config.OUTPUT_FORMAT == 'flac':
@@ -661,15 +674,30 @@ class IntelligentStudioPipeline:
             else:  # opus
                 codec_params = f"-c:a libopus -b:a {self.config.OUTPUT_BITRATE}k"
             
-            master_cmd = (
-                f"ffmpeg -i '{current_file}' -af "
-                f"'highpass=f={self.config.HIGHPASS_FREQ}, "
-                f"equalizer=f={self.config.EQ_CENTER_FREQ}:width_type=h:width={self.config.EQ_WIDTH}:g={boost_db}, "
-                f"deesser=f={self.config.DEESSER_FREQ}:s={self.config.DEESSER_STRENGTH}, "
-                f"loudnorm=I={self.config.LOUDNESS_TARGET}:TP={self.config.TRUE_PEAK}, "
-                f"alimiter=limit=0.99:attack=1:release=50:level=disabled' "
-                f"-ac 1 {codec_params} '{output_path}' -y"
-            )
+            if duration_minutes > 60:
+                print(f"  Large file ({duration_minutes:.1f} minutes) - using memory-efficient normalization...")
+                # Use dynaudnorm (single-pass, streaming) instead of loudnorm (two-pass, memory-intensive)
+                # dynaudnorm provides similar results without the memory overhead
+                master_cmd = (
+                    f"ffmpeg -i '{current_file}' -af "
+                    f"'highpass=f={self.config.HIGHPASS_FREQ}, "
+                    f"equalizer=f={self.config.EQ_CENTER_FREQ}:width_type=h:width={self.config.EQ_WIDTH}:g={boost_db}, "
+                    f"deesser=f={self.config.DEESSER_FREQ}:s={self.config.DEESSER_STRENGTH}, "
+                    f"dynaudnorm=f=150:g=15:p=0.95:m=10:r=0.5:b=1, "
+                    f"alimiter=limit=0.99:attack=1:release=50:level=disabled' "
+                    f"-ac 1 {codec_params} '{output_path}' -y"
+                )
+            else:
+                # Use standard loudnorm for smaller files (more accurate but memory-intensive)
+                master_cmd = (
+                    f"ffmpeg -i '{current_file}' -af "
+                    f"'highpass=f={self.config.HIGHPASS_FREQ}, "
+                    f"equalizer=f={self.config.EQ_CENTER_FREQ}:width_type=h:width={self.config.EQ_WIDTH}:g={boost_db}, "
+                    f"deesser=f={self.config.DEESSER_FREQ}:s={self.config.DEESSER_STRENGTH}, "
+                    f"loudnorm=I={self.config.LOUDNESS_TARGET}:TP={self.config.TRUE_PEAK}, "
+                    f"alimiter=limit=0.99:attack=1:release=50:level=disabled' "
+                    f"-ac 1 {codec_params} '{output_path}' -y"
+                )
 
             # Use check=True to catch FFmpeg failures
             try:
