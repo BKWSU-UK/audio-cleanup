@@ -223,6 +223,91 @@ Both formats are optimized for:
 - Broadcast-ready loudness (-16 LUFS)
 - Controlled peaks (-1.5 dB true peak)
 
+## API Server
+
+The pipeline can also be run as a REST API server, allowing audio files to be uploaded, processed, and downloaded over HTTP.
+
+### Starting the Server
+
+```bash
+python api_server.py                     # Default: 0.0.0.0:8000
+python api_server.py --port 9000         # Custom port
+python api_server.py --reload            # Auto-reload on code changes (development)
+```
+
+Interactive API docs are available at `http://localhost:8000/docs` (Swagger UI).
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/process` | **Synchronous** — upload, process, receive file in response |
+| `POST` | `/jobs` | **Asynchronous** — upload and start background processing |
+| `GET` | `/jobs` | List all jobs |
+| `GET` | `/jobs/{job_id}` | Poll job status |
+| `GET` | `/jobs/{job_id}/download` | Download completed result |
+| `DELETE` | `/jobs/{job_id}` | Delete a job and its files |
+
+### Synchronous Processing
+
+Upload a file and receive the processed audio directly in the response (blocks until complete):
+
+```bash
+curl -X POST "http://localhost:8000/process?output_format=flac" \
+  -F "file=@recording.flac" \
+  -o enhanced.flac
+```
+
+### Asynchronous Processing
+
+Submit a job, poll for completion, then download:
+
+```bash
+# 1. Submit
+curl -X POST "http://localhost:8000/jobs?output_format=flac&no_ai=true" \
+  -F "file=@recording.flac"
+# Returns: {"job_id": "abc-123", "status": "pending", ...}
+
+# 2. Poll status
+curl http://localhost:8000/jobs/abc-123
+# Returns: {"status": "completed", "download_url": "/jobs/abc-123/download", ...}
+
+# 3. Download
+curl http://localhost:8000/jobs/abc-123/download -o enhanced.flac
+
+# 4. Cleanup
+curl -X DELETE http://localhost:8000/jobs/abc-123
+```
+
+### API Parameters
+
+All pipeline parameters are available as query parameters on both `/process` and `/jobs`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `no_preprocessing` | `false` | Disable preprocessing |
+| `no_ai` | `false` | Disable AI enhancement |
+| `no_spectral_denoise` | `false` | Disable spectral noise reduction |
+| `no_noise_gate` | `false` | Disable noise gate |
+| `no_mastering` | `false` | Disable mastering |
+| `output_format` | `opus` | Output format: `opus` or `flac` |
+| `bitrate` | `64` | Opus bitrate in kbps |
+| `noise_reduction` | `12` | Spectral noise reduction in dB |
+| `noise_sensitivity` | `0.15` | Noise detection sensitivity (0–1) |
+| `gate_threshold` | `-45` | Noise gate threshold in dB FS |
+| `gate_attack` | `5` | Gate attack time in ms |
+| `gate_release` | `50` | Gate release time in ms |
+| `highpass` | `100` | Highpass filter frequency in Hz |
+| `loudness` | `-16` | Target loudness in LUFS |
+| `true_peak` | `-1.5` | True peak limit in dB |
+
+### Error Handling
+
+- **Synchronous** (`/process`): Returns HTTP 500 with error detail in JSON body
+- **Asynchronous** (`/jobs`): Job status becomes `failed` with error detail in the `error` field
+- **404**: Returned when polling a non-existent job ID
+- **409**: Returned when trying to download a still-processing job, or delete a processing job
+
 ## Troubleshooting
 
 - **"FFmpeg not found"**: Ensure FFmpeg is installed and in your system PATH

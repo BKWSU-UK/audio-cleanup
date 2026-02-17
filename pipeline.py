@@ -63,73 +63,75 @@ class IntelligentStudioPipeline:
         if self.config.ENABLE_AI_ENHANCEMENT:
             self.ai_engine = ClearVoice(task='speech_enhancement', model_names=['MossFormer2_SE_48K'])
 
-    def _convert_to_wav_for_analysis(self, audio_path):
-        """Convert any audio format to temporary WAV for analysis."""
+    def _load_analysis_sample(self, audio_path, sample_seconds=30):
+        """Load a sample of audio for analysis, converting from any format.
+        
+        Extracts a segment from the middle of the file to avoid intros/outros.
+        Returns (sample_rate, data) where data retains its original channel layout.
+        """
         import tempfile
         temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         temp_wav.close()
         
-        cmd = f"ffmpeg -i '{audio_path}' -ar 48000 '{temp_wav.name}' -y"
-        result = subprocess.run(cmd, shell=True, capture_output=True)
+        try:
+            cmd = f"ffmpeg -i '{audio_path}' -ar 48000 '{temp_wav.name}' -y"
+            result = subprocess.run(cmd, shell=True, capture_output=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to convert {audio_path} to WAV for analysis")
+            
+            sr, data = wav.read(temp_wav.name)
+        finally:
+            if os.path.exists(temp_wav.name):
+                os.remove(temp_wav.name)
         
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to convert {audio_path} to WAV for analysis")
+        # Extract a sample from the middle of the file
+        total_samples = data.shape[0]
+        sample_len = int(sr * sample_seconds)
         
-        return temp_wav.name
+        if total_samples > sample_len:
+            start = (total_samples - sample_len) // 2
+            data = data[start:start + sample_len]
+        
+        return sr, data
 
-    def select_best_channel(self, audio_path):
+    def select_best_channel(self, sr, data):
         """Analyze stereo audio and select the channel with better quality.
         
-        Criteria:
-        - Higher RMS energy (louder = better signal)
-        - Lower noise floor in quiet regions
-        - Better signal-to-noise ratio
+        Args:
+            sr: Sample rate
+            data: Audio data array (from _load_analysis_sample)
         
         Returns the best channel index (0 or 1) or None if mono.
         """
-        temp_wav = None
-        try:
-            # Convert to WAV if not already
-            if not audio_path.lower().endswith('.wav'):
-                temp_wav = self._convert_to_wav_for_analysis(audio_path)
-                analysis_path = temp_wav
-            else:
-                analysis_path = audio_path
-            
-            sr, data = wav.read(analysis_path)
-            
-            # If mono, return None
-            if len(data.shape) == 1:
-                return None
-            
-            # Analyze both channels
-            left = data[:, 0].astype(np.float32)
-            right = data[:, 1].astype(np.float32)
-            
-            # Calculate RMS energy for each channel
-            rms_left = np.sqrt(np.mean(left ** 2))
-            rms_right = np.sqrt(np.mean(right ** 2))
-            
-            # Calculate noise floor (bottom 10% of energy)
-            left_sorted = np.sort(np.abs(left))
-            right_sorted = np.sort(np.abs(right))
-            noise_floor_left = np.mean(left_sorted[:len(left_sorted)//10])
-            noise_floor_right = np.mean(right_sorted[:len(right_sorted)//10])
-            
-            # Calculate SNR approximation
-            snr_left = rms_left / (noise_floor_left + 1e-10)
-            snr_right = rms_right / (noise_floor_right + 1e-10)
-            
-            # Select channel with better SNR
-            if snr_left > snr_right:
-                print(f"Stereo detected: Using LEFT channel (SNR: {snr_left:.1f} vs {snr_right:.1f})")
-                return 0
-            else:
-                print(f"Stereo detected: Using RIGHT channel (SNR: {snr_right:.1f} vs {snr_left:.1f})")
-                return 1
-        finally:
-            if temp_wav and os.path.exists(temp_wav):
-                os.remove(temp_wav)
+        # If mono, return None
+        if len(data.shape) == 1:
+            return None
+        
+        # Analyze both channels
+        left = data[:, 0].astype(np.float32)
+        right = data[:, 1].astype(np.float32)
+        
+        # Calculate RMS energy for each channel
+        rms_left = np.sqrt(np.mean(left ** 2))
+        rms_right = np.sqrt(np.mean(right ** 2))
+        
+        # Calculate noise floor (bottom 10% of energy)
+        left_sorted = np.sort(np.abs(left))
+        right_sorted = np.sort(np.abs(right))
+        noise_floor_left = np.mean(left_sorted[:len(left_sorted)//10])
+        noise_floor_right = np.mean(right_sorted[:len(right_sorted)//10])
+        
+        # Calculate SNR approximation
+        snr_left = rms_left / (noise_floor_left + 1e-10)
+        snr_right = rms_right / (noise_floor_right + 1e-10)
+        
+        # Select channel with better SNR
+        if snr_left > snr_right:
+            print(f"Stereo detected: Using LEFT channel (SNR: {snr_left:.1f} vs {snr_right:.1f})")
+            return 0
+        else:
+            print(f"Stereo detected: Using RIGHT channel (SNR: {snr_right:.1f} vs {snr_left:.1f})")
+            return 1
 
     def adaptive_spectral_denoise(self, wav_path, output_path, noise_reduction_db=None, sensitivity=None):
         """Self-calibrating spectral noise reduction using automatic noise profile detection.
@@ -153,12 +155,7 @@ class IntelligentStudioPipeline:
         
         sr, data = wav.read(wav_path)
         if len(data.shape) > 1:
-            # Select best channel instead of averaging
-            best_channel = self.select_best_channel(wav_path)
-            if best_channel is not None:
-                data = data[:, best_channel]
-            else:
-                data = data.mean(axis=1)
+            data = data.mean(axis=1)
         
         # Normalize to float
         if data.dtype == np.int16:
@@ -310,93 +307,77 @@ class IntelligentStudioPipeline:
         
         return output_path
 
-    def needs_low_pass(self, audio_path):
-        """Analyzes if high-frequencies are speech or codec junk."""
-        temp_wav = None
-        try:
-            # Convert to WAV if not already
-            if not audio_path.lower().endswith('.wav'):
-                temp_wav = self._convert_to_wav_for_analysis(audio_path)
-                analysis_path = temp_wav
-            else:
-                analysis_path = audio_path
-            
-            sr, data = wav.read(analysis_path)
-            if len(data.shape) > 1: data = data.mean(axis=1)
+    def needs_low_pass(self, sr, data):
+        """Analyzes if high-frequencies are speech or codec junk.
+        
+        Args:
+            sr: Sample rate
+            data: Audio data array (from _load_analysis_sample), mono or stereo
+        """
+        if len(data.shape) > 1:
+            data = data.mean(axis=1)
 
-            yf = rfft(data)
-            xf = rfftfreq(len(data), 1/sr)
+        yf = rfft(data)
+        xf = rfftfreq(len(data), 1/sr)
 
-            # Band energy comparison
-            mid_core = np.mean(np.abs(yf[(xf >= 1000) & (xf <= 4000)]))
-            high_junk = np.mean(np.abs(yf[(xf >= 10000) & (xf <= 15000)]))
+        # Band energy comparison
+        mid_core = np.mean(np.abs(yf[(xf >= 1000) & (xf <= 4000)]))
+        high_junk = np.mean(np.abs(yf[(xf >= 10000) & (xf <= 15000)]))
 
-            ratio = high_junk / (mid_core + 1e-9)
-            # Threshold: If < threshold% energy remains at 10kHz+, it's likely junk
-            return ratio < self.config.LOW_PASS_THRESHOLD
-        finally:
-            if temp_wav and os.path.exists(temp_wav):
-                os.remove(temp_wav)
+        ratio = high_junk / (mid_core + 1e-9)
+        # Threshold: If < threshold% energy remains at 10kHz+, it's likely junk
+        return ratio < self.config.LOW_PASS_THRESHOLD
 
-    def analyze_clarity(self, audio_path):
+    def analyze_clarity(self, wav_path):
         """Measures post-AI muffleness to determine EQ boost.
         
         Also detects heavily compressed audio (low dynamic range) and reduces
         boost to prevent clipping.
+        
+        Args:
+            wav_path: Path to a WAV file (always WAV at this pipeline stage)
         """
-        temp_wav = None
-        try:
-            # Convert to WAV if not already
-            if not audio_path.lower().endswith('.wav'):
-                temp_wav = self._convert_to_wav_for_analysis(audio_path)
-                analysis_path = temp_wav
-            else:
-                analysis_path = audio_path
-            
-            sr, data = wav.read(analysis_path)
-            if len(data.shape) > 1: data = data.mean(axis=1)
-            
-            # Normalize to float
-            if data.dtype == np.int16:
-                data = data.astype(np.float32) / 32768.0
-            elif data.dtype == np.int32:
-                data = data.astype(np.float32) / 2147483648.0
-            
-            # Check dynamic range (crest factor) to detect heavy compression
-            peak = np.max(np.abs(data))
-            rms = np.sqrt(np.mean(data ** 2))
-            crest_factor_db = 20 * np.log10((peak / (rms + 1e-10)) + 1e-10)
-            
-            # Debug output
-            print(f"  Analysis: Peak={peak:.3f}, RMS={rms:.3f}, Crest Factor={crest_factor_db:.1f}dB")
-            
-            # Typical speech has 12-20dB crest factor
-            # Heavily compressed audio has < 8dB crest factor
-            is_heavily_compressed = crest_factor_db < 8.0
-            
-            if is_heavily_compressed:
-                print(f"  Detected heavy compression - reducing EQ boost")
-            
-            yf = rfft(data)
-            xf = rfftfreq(len(data), 1/sr)
+        sr, data = wav.read(wav_path)
+        if len(data.shape) > 1: data = data.mean(axis=1)
+        
+        # Normalize to float
+        if data.dtype == np.int16:
+            data = data.astype(np.float32) / 32768.0
+        elif data.dtype == np.int32:
+            data = data.astype(np.float32) / 2147483648.0
+        
+        # Check dynamic range (crest factor) to detect heavy compression
+        peak = np.max(np.abs(data))
+        rms = np.sqrt(np.mean(data ** 2))
+        crest_factor_db = 20 * np.log10((peak / (rms + 1e-10)) + 1e-10)
+        
+        # Debug output
+        print(f"  Analysis: Peak={peak:.3f}, RMS={rms:.3f}, Crest Factor={crest_factor_db:.1f}dB")
+        
+        # Typical speech has 12-20dB crest factor
+        # Heavily compressed audio has < 8dB crest factor
+        is_heavily_compressed = crest_factor_db < 8.0
+        
+        if is_heavily_compressed:
+            print(f"  Detected heavy compression - reducing EQ boost")
+        
+        yf = rfft(data)
+        xf = rfftfreq(len(data), 1/sr)
 
-            low_mid = np.mean(np.abs(yf[(xf >= 200) & (xf <= 500)]))
-            presence = np.mean(np.abs(yf[(xf >= 3000) & (xf <= 6000)]))
+        low_mid = np.mean(np.abs(yf[(xf >= 200) & (xf <= 500)]))
+        presence = np.mean(np.abs(yf[(xf >= 3000) & (xf <= 6000)]))
 
-            ratio = presence / (low_mid + 1e-9)
-            
-            # Reduce EQ boost for compressed audio to prevent clipping
-            if is_heavily_compressed:
-                if ratio < 0.06: return 3   # Reduced from 8
-                if ratio < 0.15: return 2   # Reduced from 4
-                return 0
-            else:
-                if ratio < 0.06: return 8   # Boost significantly
-                if ratio < 0.15: return 4   # Boost moderately
-                return 0
-        finally:
-            if temp_wav and os.path.exists(temp_wav):
-                os.remove(temp_wav)
+        ratio = presence / (low_mid + 1e-9)
+        
+        # Reduce EQ boost for compressed audio to prevent clipping
+        if is_heavily_compressed:
+            if ratio < 0.06: return 3   # Reduced from 8
+            if ratio < 0.15: return 2   # Reduced from 4
+            return 0
+        else:
+            if ratio < 0.06: return 8   # Boost significantly
+            if ratio < 0.15: return 4   # Boost moderately
+            return 0
 
     def process_file(self, raw_path, output_path):
         # Ensure absolute paths to prevent the empty string error
@@ -423,8 +404,11 @@ class IntelligentStudioPipeline:
             temp_pre = os.path.join(output_dir, f"1-preprocessed_{base_name}.wav")
             temp_files.append(temp_pre)
             
+            # Load a 30-second sample once for all pre-processing analysis
+            sr_sample, data_sample = self._load_analysis_sample(raw_path)
+            
             # Check if stereo and select best channel
-            best_channel = self.select_best_channel(raw_path)
+            best_channel = self.select_best_channel(sr_sample, data_sample)
             
             # Build channel selection filter
             if best_channel is not None:
@@ -433,7 +417,7 @@ class IntelligentStudioPipeline:
                 channel_filter = ""
             
             # We check the original file for frequency health.
-            if self.needs_low_pass(raw_path):
+            if self.needs_low_pass(sr_sample, data_sample):
                 print(f"Decision: Poor HF detected. Applying {self.config.LOW_PASS_CUTOFF}Hz Low-pass pre-filter.")
                 # Clip transient peaks (mic knocks), low-pass, normalize speech, then reduce by 2dB for AI headroom
                 cmd = f"ffmpeg -i '{raw_path}' -af '{channel_filter}alimiter=limit=0.95:attack=0.1:release=5,lowpass=f={self.config.LOW_PASS_CUTOFF},speechnorm=expansion={self.config.SPEECHNORM_EXPANSION},volume=-2dB' -ar 48000 '{temp_pre}' -y"
