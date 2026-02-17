@@ -7,14 +7,19 @@ clearvoice
 numpy>=1.24.0
 scipy>=1.10.0
 
-# FFT acceleration (install one or both; CuPy preferred on GPU instances)
-cupy-cuda12x  # GPU-accelerated FFT via CUDA (for NVIDIA GPU instances)
-pyfftw  # Multi-threaded CPU FFT fallback (used when no GPU available)
+# FFT acceleration - CPU fallback (always install)
+pyfftw
 
-# API server
+# API server dependencies
 fastapi
 uvicorn
 python-multipart
+
+# Optional: GPU acceleration (NVIDIA GPU with CUDA 12.x only)
+# Uncomment the appropriate line based on your CUDA version:
+cupy-cuda12x  # For CUDA 12.x
+# cupy-cuda11x  # For CUDA 11.x
+# If installed, the pipeline will automatically use GPU acceleration for spectral processing
 
 # No additional requirements needed - FFmpeg is assumed to be installed system-wide
 # Install FFmpeg separately:

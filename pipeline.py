@@ -229,6 +229,8 @@ class IntelligentStudioPipeline:
         Uses pyfftw for multi-threaded FFT when available, with float32 precision
         throughout for reduced memory bandwidth.
         
+        For large files (>10 minutes), processes audio in chunks to avoid memory issues.
+        
         Args:
             wav_path: Input WAV file path
             output_path: Output WAV file path
@@ -258,56 +260,122 @@ class IntelligentStudioPipeline:
         noverlap = nperseg // 2
         original_len = len(data)
         
-        # Compute STFT (GPU/pyfftw/NumPy accelerated)
-        Zxx, window, on_gpu = self._stft(data, nperseg, noverlap)
+        # Check if file is large (>10 minutes) and needs chunked processing
+        duration_minutes = len(data) / sr / 60
+        chunk_size_samples = sr * 300  # 5 minutes per chunk
         
-        # Use xp as array module — CuPy on GPU, NumPy on CPU
-        xp = cp if on_gpu else np
-        
-        # Work with magnitude in-place to reduce allocations
-        magnitude = xp.abs(Zxx)
-        
-        # Calculate energy per time frame
-        frame_energy = xp.sum(magnitude ** 2, axis=0)
-        
-        # Detect noise-only regions (bottom sensitivity% of energy)
-        energy_threshold = xp.percentile(frame_energy, sensitivity * 100)
-        noise_frames = frame_energy < energy_threshold
-        
-        # Build noise profile from quiet regions across the ENTIRE file
-        # Using mean instead of median — O(n) vs O(n log n), negligible quality difference
-        noise_count = int(xp.sum(noise_frames))
-        if noise_count > 0:
-            noise_profile = xp.mean(magnitude[:, noise_frames], axis=1)
+        if duration_minutes > 10:
+            print(f"  Large file detected ({duration_minutes:.1f} minutes) - using chunked processing...")
+            
+            # Step 1: Build noise profile from a representative sample (first 5 minutes)
+            sample_data = data[:min(chunk_size_samples, len(data))]
+            Zxx_sample, window, on_gpu = self._stft(sample_data, nperseg, noverlap)
+            xp = cp if on_gpu else np
+            
+            magnitude_sample = xp.abs(Zxx_sample)
+            frame_energy = xp.sum(magnitude_sample ** 2, axis=0)
+            energy_threshold = xp.percentile(frame_energy, sensitivity * 100)
+            noise_frames = frame_energy < energy_threshold
+            
+            noise_count = int(xp.sum(noise_frames))
+            if noise_count > 0:
+                noise_profile = xp.mean(magnitude_sample[:, noise_frames], axis=1)
+            else:
+                noise_profile = xp.percentile(magnitude_sample, 10, axis=1)
+            
+            # Convert noise profile to CPU for reuse across chunks
+            if on_gpu:
+                noise_profile = cp.asnumpy(noise_profile)
+            
+            # Step 2: Process audio in chunks
+            output_audio = np.zeros(original_len, dtype=np.float32)
+            overlap_samples = nperseg * 2  # Overlap between chunks to avoid artifacts
+            
+            num_chunks = int(np.ceil(len(data) / chunk_size_samples))
+            for i in range(num_chunks):
+                start_idx = max(0, i * chunk_size_samples - overlap_samples)
+                end_idx = min(len(data), (i + 1) * chunk_size_samples + overlap_samples)
+                chunk = data[start_idx:end_idx]
+                
+                # Process chunk
+                Zxx_chunk, _, on_gpu = self._stft(chunk, nperseg, noverlap)
+                xp = cp if on_gpu else np
+                
+                # Upload noise profile to GPU if needed
+                noise_profile_xp = xp.asarray(noise_profile) if on_gpu else noise_profile
+                
+                magnitude = xp.abs(Zxx_chunk)
+                reduction_factor = xp.float32(10 ** (noise_reduction_db / 20))
+                noise_scaled = (noise_profile_xp * reduction_factor)[:, xp.newaxis]
+                
+                magnitude -= noise_scaled
+                spectral_floor = xp.abs(Zxx_chunk) * xp.float32(0.01)
+                xp.maximum(magnitude, spectral_floor, out=magnitude)
+                
+                abs_Zxx = xp.abs(Zxx_chunk)
+                abs_Zxx[abs_Zxx < 1e-10] = 1e-10
+                Zxx_chunk *= (magnitude / abs_Zxx)
+                
+                chunk_cleaned = self._istft(Zxx_chunk, window, nperseg, noverlap, len(chunk), on_gpu)
+                
+                # Calculate which portion of the cleaned chunk to use
+                write_start = i * chunk_size_samples
+                write_end = min(original_len, write_start + chunk_size_samples)
+                write_length = write_end - write_start
+                
+                if i == 0:
+                    # First chunk: skip initial overlap (it doesn't exist), take from start
+                    chunk_start = 0
+                    chunk_end = min(write_length, len(chunk_cleaned))
+                elif i == num_chunks - 1:
+                    # Last chunk: skip the overlap region at the start
+                    chunk_start = overlap_samples
+                    chunk_end = min(chunk_start + write_length, len(chunk_cleaned))
+                else:
+                    # Middle chunks: skip overlap at start
+                    chunk_start = overlap_samples
+                    chunk_end = min(chunk_start + write_length, len(chunk_cleaned))
+                
+                # Copy the valid portion
+                valid_length = min(write_length, chunk_end - chunk_start)
+                output_audio[write_start:write_start + valid_length] = chunk_cleaned[chunk_start:chunk_start + valid_length]
+                
+                print(f"    Processed chunk {i+1}/{num_chunks}")
+            
+            audio_cleaned = output_audio
         else:
-            # Fallback: use lowest 10% of each frequency bin across entire file
-            noise_profile = xp.percentile(magnitude, 10, axis=1)
-        
-        # For better initial performance, also look at the first 2 seconds specifically
-        # and boost the noise profile if the beginning is quieter (common in recordings)
-        first_2sec_frames = int(2.0 * sr / (nperseg - noverlap))
-        if first_2sec_frames < Zxx.shape[1]:
-            initial_noise = xp.percentile(magnitude[:, :first_2sec_frames], 20, axis=1)
-            # Use the maximum of the two profiles to ensure we catch initial noise
-            xp.maximum(noise_profile, initial_noise * 0.8, out=noise_profile)
-        
-        # Apply spectral subtraction with oversubtraction factor
-        reduction_factor = xp.float32(10 ** (noise_reduction_db / 20))
-        noise_scaled = (noise_profile * reduction_factor)[:, xp.newaxis]
-        
-        # Subtract noise and apply spectral floor in-place
-        magnitude -= noise_scaled
-        spectral_floor = xp.abs(Zxx) * xp.float32(0.01)
-        xp.maximum(magnitude, spectral_floor, out=magnitude)
-        
-        # Reconstruct: apply cleaned magnitude to original phase (avoid angle + exp)
-        # Zxx_cleaned = magnitude * (Zxx / |Zxx|) — reuses original phase implicitly
-        abs_Zxx = xp.abs(Zxx)
-        abs_Zxx[abs_Zxx < 1e-10] = 1e-10  # avoid division by zero
-        Zxx *= (magnitude / abs_Zxx)
-        
-        # Inverse STFT (transfers back to CPU for overlap-add and file write)
-        audio_cleaned = self._istft(Zxx, window, nperseg, noverlap, original_len, on_gpu)
+            # Original single-pass processing for smaller files
+            Zxx, window, on_gpu = self._stft(data, nperseg, noverlap)
+            xp = cp if on_gpu else np
+            
+            magnitude = xp.abs(Zxx)
+            frame_energy = xp.sum(magnitude ** 2, axis=0)
+            energy_threshold = xp.percentile(frame_energy, sensitivity * 100)
+            noise_frames = frame_energy < energy_threshold
+            
+            noise_count = int(xp.sum(noise_frames))
+            if noise_count > 0:
+                noise_profile = xp.mean(magnitude[:, noise_frames], axis=1)
+            else:
+                noise_profile = xp.percentile(magnitude, 10, axis=1)
+            
+            first_2sec_frames = int(2.0 * sr / (nperseg - noverlap))
+            if first_2sec_frames < Zxx.shape[1]:
+                initial_noise = xp.percentile(magnitude[:, :first_2sec_frames], 20, axis=1)
+                xp.maximum(noise_profile, initial_noise * 0.8, out=noise_profile)
+            
+            reduction_factor = xp.float32(10 ** (noise_reduction_db / 20))
+            noise_scaled = (noise_profile * reduction_factor)[:, xp.newaxis]
+            
+            magnitude -= noise_scaled
+            spectral_floor = xp.abs(Zxx) * xp.float32(0.01)
+            xp.maximum(magnitude, spectral_floor, out=magnitude)
+            
+            abs_Zxx = xp.abs(Zxx)
+            abs_Zxx[abs_Zxx < 1e-10] = 1e-10
+            Zxx *= (magnitude / abs_Zxx)
+            
+            audio_cleaned = self._istft(Zxx, window, nperseg, noverlap, original_len, on_gpu)
         
         # Convert back to int16
         np.clip(audio_cleaned, -1.0, 1.0, out=audio_cleaned)
@@ -317,6 +385,8 @@ class IntelligentStudioPipeline:
 
     def apply_noise_gate(self, wav_path, output_path, threshold_db=None, attack_ms=None, release_ms=None):
         """Apply a noise gate to remove residual hiss during quiet passages.
+        
+        Uses streaming processing for large files to avoid memory issues.
         
         Args:
             wav_path: Input WAV file path
@@ -348,32 +418,58 @@ class IntelligentStudioPipeline:
         # Convert threshold from dB to linear
         threshold_linear = np.float32(10 ** (threshold_db / 20))
         
-        # Calculate envelope using vectorized RMS in small windows
+        # Calculate envelope using simple moving RMS
         window_size = int(sr * 0.01)  # 10ms windows
         hop_size = window_size // 2
         
-        # Vectorized RMS: use cumulative sum of squares for O(1) per window
-        padded_data = np.pad(data, (window_size // 2, window_size // 2), mode='reflect')
-        squared = padded_data.astype(np.float32) ** 2
-        cumsum = np.concatenate(([0], np.cumsum(squared)))
-        frame_starts = np.arange(0, len(data), hop_size)
-        frame_ends = np.minimum(frame_starts + window_size, len(cumsum) - 1)
-        envelope = np.sqrt((cumsum[frame_ends] - cumsum[frame_starts]) / window_size)
+        # For large files, compute envelope in chunks to avoid memory issues
+        duration_minutes = len(data) / sr / 60
+        if duration_minutes > 30:
+            print(f"  Large file ({duration_minutes:.1f} minutes) - using streaming gate calculation...")
+            
+            # Compute envelope in chunks
+            chunk_size = sr * 60  # 1 minute chunks
+            envelope_list = []
+            frame_starts_list = []
+            
+            for chunk_start in range(0, len(data), chunk_size):
+                chunk_end = min(chunk_start + chunk_size + window_size, len(data))
+                chunk = data[chunk_start:chunk_end]
+                
+                # Pad chunk
+                padded_chunk = np.pad(chunk, (window_size // 2, window_size // 2), mode='reflect')
+                
+                # Compute envelope for this chunk using strided view (memory efficient)
+                n_frames = (len(chunk) + hop_size - 1) // hop_size
+                envelope_chunk = np.zeros(n_frames, dtype=np.float32)
+                
+                for i in range(n_frames):
+                    start_idx = i * hop_size
+                    end_idx = min(start_idx + window_size, len(padded_chunk))
+                    window_data = padded_chunk[start_idx:end_idx]
+                    envelope_chunk[i] = np.sqrt(np.mean(window_data ** 2))
+                
+                envelope_list.append(envelope_chunk)
+                frame_starts_list.append(np.arange(chunk_start, chunk_start + len(chunk), hop_size))
+            
+            envelope = np.concatenate(envelope_list)
+            frame_starts = np.concatenate(frame_starts_list)
+        else:
+            # Original fast method for smaller files
+            padded_data = np.pad(data, (window_size // 2, window_size // 2), mode='reflect')
+            squared = padded_data.astype(np.float32) ** 2
+            cumsum = np.concatenate(([0], np.cumsum(squared)))
+            frame_starts = np.arange(0, len(data), hop_size)
+            frame_ends = np.minimum(frame_starts + window_size, len(cumsum) - 1)
+            envelope = np.sqrt((cumsum[frame_ends] - cumsum[frame_starts]) / window_size)
         
         # Create gate signal (1 = open, 0 = closed)
         gate_signal = (envelope > threshold_linear).astype(np.float32)
         
         # Vectorized attack/release smoothing using lfilter
-        # Attack: fast rise (gate opening), Release: slow fall (gate closing)
-        # We run two separate single-pole IIR filters and combine:
-        #   - attack filter (fast) applied to gate_signal
-        #   - release filter (slow) applied to gate_signal
-        #   - take max of gate_signal and release-filtered, then apply attack smoothing
         attack_alpha = np.float32(1.0 - np.exp(-1.0 / max(1, attack_ms * sr / (1000 * hop_size))))
         release_alpha = np.float32(1.0 - np.exp(-1.0 / max(1, release_ms * sr / (1000 * hop_size))))
         
-        # Single-pole IIR: y[n] = alpha * x[n] + (1-alpha) * y[n-1]
-        # This is lfilter with b=[alpha], a=[1, -(1-alpha)]
         # Apply release (slow decay) first, then attack (fast rise)
         release_smoothed = lfilter([release_alpha], [1, -(1 - release_alpha)], gate_signal).astype(np.float32)
         smoothed_gate = lfilter([attack_alpha], [1, -(1 - attack_alpha)], 
@@ -382,8 +478,8 @@ class IntelligentStudioPipeline:
         # Interpolate gate signal to match audio length
         gate_full = np.interp(
             np.arange(len(data)),
-            frame_starts,
-            smoothed_gate[:len(frame_starts)]
+            frame_starts[:len(smoothed_gate)],
+            smoothed_gate
         ).astype(np.float32)
         
         # Apply gate to audio
