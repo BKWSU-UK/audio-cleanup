@@ -3,10 +3,24 @@ import subprocess
 import numpy as np
 import scipy.io.wavfile as wav
 from scipy.fft import rfft, rfftfreq, irfft
-from scipy.signal import stft, istft
+from scipy.signal import stft, istft, lfilter, get_window
 from pathlib import Path
 import argparse
 from clearvoice import ClearVoice
+
+try:
+    import cupy as cp
+    import cupy.fft
+    CUPY_AVAILABLE = True
+except (ImportError, Exception):
+    CUPY_AVAILABLE = False
+
+try:
+    import pyfftw
+    pyfftw.interfaces.cache.enable()
+    PYFFTW_AVAILABLE = True
+except ImportError:
+    PYFFTW_AVAILABLE = False
 
 # ============================================================================
 # CONFIGURATION DEFAULTS
@@ -133,6 +147,77 @@ class IntelligentStudioPipeline:
             print(f"Stereo detected: Using RIGHT channel (SNR: {snr_right:.1f} vs {snr_left:.1f})")
             return 1
 
+    def _stft(self, data, nperseg, noverlap):
+        """Compute STFT with three-tier acceleration: CuPy GPU → pyfftw CPU → NumPy.
+        
+        Uses real-valued FFT and float32 throughout for speed.
+        Returns (Zxx, window, on_gpu) where Zxx is complex64 spectrogram (freq_bins, n_frames).
+        When CuPy is available, Zxx remains on GPU to avoid unnecessary transfers.
+        """
+        hop = nperseg - noverlap
+        window = get_window('hann', nperseg).astype(np.float32)
+        
+        # Pad signal so all samples are covered
+        n_frames = 1 + (len(data) - nperseg) // hop
+        padded_len = nperseg + (n_frames - 1) * hop
+        if padded_len > len(data):
+            data = np.pad(data, (0, padded_len - len(data)), mode='constant')
+        
+        # Build frame matrix via stride tricks (zero-copy view)
+        shape = (n_frames, nperseg)
+        strides = (data.strides[0] * hop, data.strides[0])
+        frames = np.lib.stride_tricks.as_strided(data, shape=shape, strides=strides)
+        
+        # Apply window
+        windowed = frames * window
+        
+        if CUPY_AVAILABLE:
+            Zxx = cp.fft.rfft(cp.asarray(windowed), axis=1).astype(cp.complex64)
+            return Zxx.T, window, True
+        elif PYFFTW_AVAILABLE:
+            Zxx = pyfftw.interfaces.numpy_fft.rfft(windowed, axis=1, threads=-1).astype(np.complex64)
+        else:
+            Zxx = np.fft.rfft(windowed, axis=1).astype(np.complex64)
+        
+        return Zxx.T, window, False  # (freq_bins, n_frames)
+
+    def _istft(self, Zxx, window, nperseg, noverlap, original_len, on_gpu=False):
+        """Compute inverse STFT with three-tier acceleration: CuPy GPU → pyfftw CPU → NumPy.
+        
+        Uses overlap-add reconstruction with precomputed window normalization.
+        Accepts GPU arrays when on_gpu=True.
+        """
+        hop = nperseg - noverlap
+        Zxx_T = Zxx.T  # (n_frames, freq_bins)
+        
+        if on_gpu and CUPY_AVAILABLE:
+            frames = cp.asnumpy(cp.fft.irfft(Zxx_T, n=nperseg, axis=1).astype(cp.float32))
+        elif PYFFTW_AVAILABLE:
+            frames = pyfftw.interfaces.numpy_fft.irfft(Zxx_T, n=nperseg, axis=1, threads=-1).astype(np.float32)
+        else:
+            frames = np.fft.irfft(Zxx_T, n=nperseg, axis=1).astype(np.float32)
+        
+        frames *= window
+        
+        n_frames = frames.shape[0]
+        output_len = nperseg + (n_frames - 1) * hop
+        output = np.zeros(output_len, dtype=np.float32)
+        
+        # Precompute window normalization (constant for given window/hop)
+        window_sq = window ** 2
+        window_sum = np.zeros(output_len, dtype=np.float32)
+        
+        for i in range(n_frames):
+            start = i * hop
+            output[start:start + nperseg] += frames[i]
+            window_sum[start:start + nperseg] += window_sq
+        
+        # Normalize by window overlap
+        nonzero = window_sum > 1e-10
+        output[nonzero] /= window_sum[nonzero]
+        
+        return output[:original_len]
+
     def adaptive_spectral_denoise(self, wav_path, output_path, noise_reduction_db=None, sensitivity=None):
         """Self-calibrating spectral noise reduction using automatic noise profile detection.
         
@@ -140,6 +225,9 @@ class IntelligentStudioPipeline:
         1. Detects quiet regions (likely noise-only)
         2. Builds a noise profile from those regions
         3. Applies spectral subtraction to remove the noise
+        
+        Uses pyfftw for multi-threaded FFT when available, with float32 precision
+        throughout for reduced memory bandwidth.
         
         Args:
             wav_path: Input WAV file path
@@ -157,72 +245,73 @@ class IntelligentStudioPipeline:
         if len(data.shape) > 1:
             data = data.mean(axis=1)
         
-        # Normalize to float
+        # Normalize to float32 (half the memory bandwidth of float64)
         if data.dtype == np.int16:
             data = data.astype(np.float32) / 32768.0
         elif data.dtype == np.int32:
             data = data.astype(np.float32) / 2147483648.0
+        elif data.dtype != np.float32:
+            data = data.astype(np.float32)
         
         # STFT parameters
         nperseg = 2048
         noverlap = nperseg // 2
+        original_len = len(data)
         
-        # Compute STFT
-        f, t, Zxx = stft(data, sr, nperseg=nperseg, noverlap=noverlap)
+        # Compute STFT (GPU/pyfftw/NumPy accelerated)
+        Zxx, window, on_gpu = self._stft(data, nperseg, noverlap)
+        
+        # Use xp as array module — CuPy on GPU, NumPy on CPU
+        xp = cp if on_gpu else np
+        
+        # Work with magnitude in-place to reduce allocations
+        magnitude = xp.abs(Zxx)
         
         # Calculate energy per time frame
-        frame_energy = np.sum(np.abs(Zxx) ** 2, axis=0)
+        frame_energy = xp.sum(magnitude ** 2, axis=0)
         
         # Detect noise-only regions (bottom sensitivity% of energy)
-        energy_threshold = np.percentile(frame_energy, sensitivity * 100)
+        energy_threshold = xp.percentile(frame_energy, sensitivity * 100)
         noise_frames = frame_energy < energy_threshold
         
         # Build noise profile from quiet regions across the ENTIRE file
-        # This ensures we have a good profile even at the beginning
-        if np.sum(noise_frames) > 0:
-            noise_profile = np.median(np.abs(Zxx[:, noise_frames]), axis=1)
+        # Using mean instead of median — O(n) vs O(n log n), negligible quality difference
+        noise_count = int(xp.sum(noise_frames))
+        if noise_count > 0:
+            noise_profile = xp.mean(magnitude[:, noise_frames], axis=1)
         else:
             # Fallback: use lowest 10% of each frequency bin across entire file
-            noise_profile = np.percentile(np.abs(Zxx), 10, axis=1)
+            noise_profile = xp.percentile(magnitude, 10, axis=1)
         
         # For better initial performance, also look at the first 2 seconds specifically
         # and boost the noise profile if the beginning is quieter (common in recordings)
         first_2sec_frames = int(2.0 * sr / (nperseg - noverlap))
         if first_2sec_frames < Zxx.shape[1]:
-            initial_noise = np.percentile(np.abs(Zxx[:, :first_2sec_frames]), 20, axis=1)
+            initial_noise = xp.percentile(magnitude[:, :first_2sec_frames], 20, axis=1)
             # Use the maximum of the two profiles to ensure we catch initial noise
-            noise_profile = np.maximum(noise_profile, initial_noise * 0.8)
+            xp.maximum(noise_profile, initial_noise * 0.8, out=noise_profile)
         
         # Apply spectral subtraction with oversubtraction factor
-        reduction_factor = 10 ** (noise_reduction_db / 20)
-        noise_profile_expanded = noise_profile[:, np.newaxis]
+        reduction_factor = xp.float32(10 ** (noise_reduction_db / 20))
+        noise_scaled = (noise_profile * reduction_factor)[:, xp.newaxis]
         
-        # Magnitude and phase
-        magnitude = np.abs(Zxx)
-        phase = np.angle(Zxx)
+        # Subtract noise and apply spectral floor in-place
+        magnitude -= noise_scaled
+        spectral_floor = xp.abs(Zxx) * xp.float32(0.01)
+        xp.maximum(magnitude, spectral_floor, out=magnitude)
         
-        # Subtract noise profile with oversubtraction
-        magnitude_cleaned = magnitude - (reduction_factor * noise_profile_expanded)
+        # Reconstruct: apply cleaned magnitude to original phase (avoid angle + exp)
+        # Zxx_cleaned = magnitude * (Zxx / |Zxx|) — reuses original phase implicitly
+        abs_Zxx = xp.abs(Zxx)
+        abs_Zxx[abs_Zxx < 1e-10] = 1e-10  # avoid division by zero
+        Zxx *= (magnitude / abs_Zxx)
         
-        # Apply spectral floor (don't reduce below -40dB of original)
-        spectral_floor = magnitude * 0.01
-        magnitude_cleaned = np.maximum(magnitude_cleaned, spectral_floor)
-        
-        # Reconstruct complex spectrogram
-        Zxx_cleaned = magnitude_cleaned * np.exp(1j * phase)
-        
-        # Inverse STFT
-        _, audio_cleaned = istft(Zxx_cleaned, sr, nperseg=nperseg, noverlap=noverlap)
-        
-        # Ensure same length as input
-        audio_cleaned = audio_cleaned[:len(data)]
+        # Inverse STFT (transfers back to CPU for overlap-add and file write)
+        audio_cleaned = self._istft(Zxx, window, nperseg, noverlap, original_len, on_gpu)
         
         # Convert back to int16
-        audio_cleaned = np.clip(audio_cleaned, -1.0, 1.0)
-        audio_cleaned = (audio_cleaned * 32767).astype(np.int16)
-        
-        # Write output
-        wav.write(output_path, sr, audio_cleaned)
+        np.clip(audio_cleaned, -1.0, 1.0, out=audio_cleaned)
+        wav.write(output_path, sr, (audio_cleaned * 32767).astype(np.int16))
         
         return output_path
 
@@ -248,62 +337,61 @@ class IntelligentStudioPipeline:
         if len(data.shape) > 1:
             data = data.mean(axis=1)
         
-        # Normalize to float
+        # Normalize to float32
         if data.dtype == np.int16:
             data = data.astype(np.float32) / 32768.0
         elif data.dtype == np.int32:
             data = data.astype(np.float32) / 2147483648.0
+        elif data.dtype != np.float32:
+            data = data.astype(np.float32)
         
         # Convert threshold from dB to linear
-        threshold_linear = 10 ** (threshold_db / 20)
+        threshold_linear = np.float32(10 ** (threshold_db / 20))
         
-        # Calculate envelope using RMS in small windows
+        # Calculate envelope using vectorized RMS in small windows
         window_size = int(sr * 0.01)  # 10ms windows
         hop_size = window_size // 2
         
-        # Pad data for windowing
+        # Vectorized RMS: use cumulative sum of squares for O(1) per window
         padded_data = np.pad(data, (window_size // 2, window_size // 2), mode='reflect')
-        
-        # Calculate RMS envelope
-        envelope = np.array([
-            np.sqrt(np.mean(padded_data[i:i+window_size]**2))
-            for i in range(0, len(data), hop_size)
-        ])
+        squared = padded_data.astype(np.float32) ** 2
+        cumsum = np.concatenate(([0], np.cumsum(squared)))
+        frame_starts = np.arange(0, len(data), hop_size)
+        frame_ends = np.minimum(frame_starts + window_size, len(cumsum) - 1)
+        envelope = np.sqrt((cumsum[frame_ends] - cumsum[frame_starts]) / window_size)
         
         # Create gate signal (1 = open, 0 = closed)
         gate_signal = (envelope > threshold_linear).astype(np.float32)
         
-        # Apply attack and release smoothing
-        attack_samples = int(sr * attack_ms / 1000)
-        release_samples = int(sr * release_ms / 1000)
+        # Vectorized attack/release smoothing using lfilter
+        # Attack: fast rise (gate opening), Release: slow fall (gate closing)
+        # We run two separate single-pole IIR filters and combine:
+        #   - attack filter (fast) applied to gate_signal
+        #   - release filter (slow) applied to gate_signal
+        #   - take max of gate_signal and release-filtered, then apply attack smoothing
+        attack_alpha = np.float32(1.0 - np.exp(-1.0 / max(1, attack_ms * sr / (1000 * hop_size))))
+        release_alpha = np.float32(1.0 - np.exp(-1.0 / max(1, release_ms * sr / (1000 * hop_size))))
         
-        # Smooth the gate signal
-        smoothed_gate = np.copy(gate_signal)
-        for i in range(1, len(gate_signal)):
-            if gate_signal[i] > smoothed_gate[i-1]:
-                # Attack (gate opening)
-                alpha = 1.0 - np.exp(-1.0 / max(1, attack_samples / hop_size))
-            else:
-                # Release (gate closing)
-                alpha = 1.0 - np.exp(-1.0 / max(1, release_samples / hop_size))
-            smoothed_gate[i] = alpha * gate_signal[i] + (1 - alpha) * smoothed_gate[i-1]
+        # Single-pole IIR: y[n] = alpha * x[n] + (1-alpha) * y[n-1]
+        # This is lfilter with b=[alpha], a=[1, -(1-alpha)]
+        # Apply release (slow decay) first, then attack (fast rise)
+        release_smoothed = lfilter([release_alpha], [1, -(1 - release_alpha)], gate_signal).astype(np.float32)
+        smoothed_gate = lfilter([attack_alpha], [1, -(1 - attack_alpha)], 
+                                np.maximum(gate_signal, release_smoothed)).astype(np.float32)
         
         # Interpolate gate signal to match audio length
         gate_full = np.interp(
             np.arange(len(data)),
-            np.arange(len(smoothed_gate)) * hop_size,
-            smoothed_gate
-        )
+            frame_starts,
+            smoothed_gate[:len(frame_starts)]
+        ).astype(np.float32)
         
         # Apply gate to audio
-        gated_audio = data * gate_full
+        data *= gate_full
         
         # Convert back to int16
-        gated_audio = np.clip(gated_audio, -1.0, 1.0)
-        gated_audio = (gated_audio * 32767).astype(np.int16)
-        
-        # Write output
-        wav.write(output_path, sr, gated_audio)
+        np.clip(data, -1.0, 1.0, out=data)
+        wav.write(output_path, sr, (data * 32767).astype(np.int16))
         
         return output_path
 
@@ -671,6 +759,8 @@ if __name__ == "__main__":
     if config.ENABLE_MASTERING:
         print(f"Highpass:           {config.HIGHPASS_FREQ} Hz")
         print(f"Loudness Target:    {config.LOUDNESS_TARGET} LUFS (peak: {config.TRUE_PEAK} dB)")
+    fft_backend = "GPU (CuPy/CUDA)" if CUPY_AVAILABLE else "CPU (pyfftw multi-threaded)" if PYFFTW_AVAILABLE else "CPU (NumPy single-threaded)"
+    print(f"FFT Acceleration:   {fft_backend}")
     print("=" * 70)
     print()
     

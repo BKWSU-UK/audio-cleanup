@@ -7,6 +7,10 @@ clearvoice
 numpy>=1.24.0
 scipy>=1.10.0
 
+# FFT acceleration (install one or both; CuPy preferred on GPU instances)
+cupy-cuda12x  # GPU-accelerated FFT via CUDA (for NVIDIA GPU instances)
+pyfftw  # Multi-threaded CPU FFT fallback (used when no GPU available)
+
 # API server
 fastapi
 uvicorn
